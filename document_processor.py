@@ -2,21 +2,30 @@
 # -*- coding: utf-8 -*-
 
 """
-Document processing and indexing for question answering system.
-This module handles document loading, preprocessing, and vectorization
-to prepare for retrieval and question answering.
+Document processing module for text extraction and vectorization.
+This module handles loading different document types, extracting text,
+and converting it into vector representations for search and retrieval.
 """
 
 import os
 import re
-import json
 import logging
+import json
+from typing import List, Dict, Tuple, Optional, Union, Any
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Tuple, Optional, Union, Any
-from dataclasses import dataclass
-import pickle
-from pathlib import Path
+
+# Text extraction libraries
+import PyPDF2
+import docx
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.corpus import stopwords
+
+# Text embedding and indexing
+import torch
+from sentence_transformers import SentenceTransformer
+import faiss
 
 # Configure logging
 logging.basicConfig(
@@ -25,467 +34,458 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Try to import sentence transformers for embeddings
+# Download NLTK resources
 try:
-    from sentence_transformers import SentenceTransformer
-    HAVE_SENTENCE_TRANSFORMERS = True
-except ImportError:
-    logger.warning("SentenceTransformer not available, falling back to simple TF-IDF")
-    HAVE_SENTENCE_TRANSFORMERS = False
-    from sklearn.feature_extraction.text import TfidfVectorizer
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
 
-@dataclass
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
+
 class Document:
-    """Class to represent a document or document chunk"""
-    doc_id: str
-    text: str
-    metadata: dict
-    embedding: Optional[np.ndarray] = None
+    """Class to represent a document with its content and metadata."""
     
-    def to_dict(self):
-        """Convert to dictionary (embeddings saved separately)"""
-        return {
-            'doc_id': self.doc_id,
-            'text': self.text,
-            'metadata': self.metadata
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any], embedding: Optional[np.ndarray] = None):
-        """Create a Document from a dictionary"""
-        return cls(
-            doc_id=data['doc_id'],
-            text=data['text'],
-            metadata=data['metadata'],
-            embedding=embedding
-        )
-
-class DocumentCollection:
-    """Class to store and manage a collection of documents"""
-    
-    def __init__(self):
-        self.documents: Dict[str, Document] = {}
-        self.embeddings: Dict[str, np.ndarray] = {}
-    
-    def add_document(self, document: Document):
-        """Add a document to the collection"""
-        self.documents[document.doc_id] = document
-        if document.embedding is not None:
-            self.embeddings[document.doc_id] = document.embedding
-    
-    def get_document(self, doc_id: str) -> Optional[Document]:
-        """Get a document by ID"""
-        return self.documents.get(doc_id)
-    
-    def get_all_documents(self) -> List[Document]:
-        """Get all documents"""
-        return list(self.documents.values())
-    
-    def get_embedding(self, doc_id: str) -> Optional[np.ndarray]:
-        """Get embedding for a document"""
-        return self.embeddings.get(doc_id)
-    
-    def get_all_embeddings(self) -> Dict[str, np.ndarray]:
-        """Get all embeddings"""
-        return self.embeddings
-    
-    def save(self, directory: str):
-        """Save the document collection to files"""
-        os.makedirs(directory, exist_ok=True)
-        
-        # Save documents as JSON
-        docs_data = {doc_id: doc.to_dict() for doc_id, doc in self.documents.items()}
-        with open(os.path.join(directory, 'documents.json'), 'w') as f:
-            json.dump(docs_data, f, indent=2)
-        
-        # Save embeddings as NumPy arrays
-        if self.embeddings:
-            np.save(os.path.join(directory, 'embeddings.npy'), {
-                doc_id: embedding for doc_id, embedding in self.embeddings.items()
-            }, allow_pickle=True)
-        
-        logger.info(f"Saved {len(self.documents)} documents to {directory}")
-    
-    @classmethod
-    def load(cls, directory: str) -> 'DocumentCollection':
-        """Load a document collection from files"""
-        collection = cls()
-        
-        # Load documents
-        try:
-            with open(os.path.join(directory, 'documents.json'), 'r') as f:
-                docs_data = json.load(f)
-            
-            # Load embeddings if they exist
-            embeddings = {}
-            embedding_path = os.path.join(directory, 'embeddings.npy')
-            if os.path.exists(embedding_path):
-                embeddings = np.load(embedding_path, allow_pickle=True).item()
-            
-            # Create documents
-            for doc_id, doc_data in docs_data.items():
-                embedding = embeddings.get(doc_id)
-                collection.add_document(Document.from_dict(doc_data, embedding))
-            
-            logger.info(f"Loaded {len(collection.documents)} documents from {directory}")
-            return collection
-            
-        except FileNotFoundError:
-            logger.warning(f"No document collection found in {directory}")
-            return collection
-
-class DocumentProcessor:
-    """Process and index documents for question answering"""
-    
-    def __init__(self, model_name: str = 'all-MiniLM-L6-v2', use_gpu: bool = False):
+    def __init__(
+        self, 
+        doc_id: str, 
+        text: str, 
+        source: str,
+        title: Optional[str] = None,
+        author: Optional[str] = None,
+        date: Optional[str] = None,
+        metadata: Optional[Dict] = None
+    ):
         """
-        Initialize the document processor
+        Initialize a document.
         
         Args:
-            model_name: Name of the SentenceTransformer model to use for embeddings
-            use_gpu: Whether to use GPU for embeddings (if available)
+            doc_id: Unique identifier for the document
+            text: The text content of the document
+            source: Source file path or identifier
+            title: Document title (if available)
+            author: Document author (if available)
+            date: Document date (if available)
+            metadata: Additional metadata as dictionary
         """
-        self.collection = DocumentCollection()
+        self.doc_id = doc_id
+        self.text = text
+        self.source = source
+        self.title = title or os.path.basename(source)
+        self.author = author
+        self.date = date
+        self.metadata = metadata or {}
         
-        # Initialize the embedding model
-        if HAVE_SENTENCE_TRANSFORMERS:
-            logger.info(f"Initializing embedding model: {model_name}")
-            self.embedding_model = SentenceTransformer(model_name)
-            if use_gpu and self.embedding_model.device.type != 'cuda':
-                logger.info("Moving model to CUDA")
-                self.embedding_model.to('cuda')
-        else:
-            logger.info("Using TF-IDF for document vectorization")
-            self.embedding_model = TfidfVectorizer(
-                max_features=1024,
-                stop_words='english'
-            )
-            self._fitted = False
-    
-    def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+        # Extract chunks for better retrieval
+        self.chunks = self._chunk_text()
+        
+    def _chunk_text(self, max_chunk_size: int = 1000, overlap: int = 200) -> List[Dict]:
         """
-        Split text into overlapping chunks
+        Split document text into overlapping chunks.
         
         Args:
-            text: Text to split
-            chunk_size: Maximum chunk size (characters)
-            overlap: Overlap between chunks (characters)
+            max_chunk_size: Maximum character length for each chunk
+            overlap: Number of characters to overlap between chunks
             
         Returns:
-            List of text chunks
+            List of dictionaries containing chunks and their positions
         """
-        # Simple approach: split by newlines first, then combine
-        paragraphs = text.split('\n')
         chunks = []
-        current_chunk = ""
+        sentences = sent_tokenize(self.text)
         
-        for paragraph in paragraphs:
-            # Skip empty paragraphs
-            if not paragraph.strip():
-                continue
-                
-            # If adding this paragraph would exceed chunk size, save current chunk and start a new one
-            if len(current_chunk) + len(paragraph) > chunk_size and current_chunk:
-                chunks.append(current_chunk.strip())
-                # Start new chunk with overlap from the end of the previous chunk
-                if len(current_chunk) > overlap:
-                    # Find the start of a sentence within the overlap area if possible
-                    overlap_text = current_chunk[-overlap:]
-                    sentence_start = overlap_text.find('. ') + 2
-                    if sentence_start >= 2:  # Found a sentence boundary
-                        current_chunk = overlap_text[sentence_start:]
-                    else:
-                        current_chunk = overlap_text
-                else:
-                    current_chunk = ""
+        current_chunk = []
+        current_size = 0
+        
+        for sentence in sentences:
+            sentence_len = len(sentence)
             
-            # Add paragraph to current chunk
-            if current_chunk and not current_chunk.endswith(' '):
-                current_chunk += ' '
-            current_chunk += paragraph
+            if current_size + sentence_len <= max_chunk_size:
+                current_chunk.append(sentence)
+                current_size += sentence_len
+            else:
+                # Create chunk from current sentences
+                if current_chunk:
+                    chunk_text = ' '.join(current_chunk)
+                    chunks.append({
+                        'doc_id': self.doc_id,
+                        'text': chunk_text,
+                        'start_idx': len(''.join(current_chunk[:max(0, len(current_chunk)-overlap)])),
+                        'end_idx': len(chunk_text)
+                    })
+                
+                # Start new chunk, potentially including overlap
+                overlap_sentences = current_chunk[-3:] if len(current_chunk) > 3 else current_chunk
+                current_chunk = overlap_sentences + [sentence]
+                current_size = len(' '.join(current_chunk))
         
-        # Don't forget the last chunk
+        # Add the last chunk
         if current_chunk:
-            chunks.append(current_chunk.strip())
+            chunk_text = ' '.join(current_chunk)
+            chunks.append({
+                'doc_id': self.doc_id,
+                'text': chunk_text,
+                'start_idx': len(''.join(current_chunk[:max(0, len(current_chunk)-overlap)])),
+                'end_idx': len(chunk_text)
+            })
         
         return chunks
     
-    def process_file(self, file_path: str, document_id: Optional[str] = None, chunk_size: int = 1000, 
-                   overlap: int = 200, metadata: Optional[Dict[str, Any]] = None) -> List[str]:
+    def to_dict(self) -> Dict:
+        """Convert document to dictionary representation."""
+        return {
+            'doc_id': self.doc_id,
+            'title': self.title,
+            'source': self.source,
+            'author': self.author,
+            'date': self.date,
+            'metadata': self.metadata,
+            'text_length': len(self.text),
+            'num_chunks': len(self.chunks)
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict, text: str) -> 'Document':
+        """Create document from dictionary and text."""
+        return cls(
+            doc_id=data['doc_id'],
+            text=text,
+            source=data['source'],
+            title=data['title'],
+            author=data['author'],
+            date=data['date'],
+            metadata=data['metadata']
+        )
+
+class DocumentProcessor:
+    """Class to process documents for text extraction and vectorization."""
+    
+    def __init__(self, model_name: str = 'distilbert-base-nli-stsb-mean-tokens'):
         """
-        Process a text file into document chunks
+        Initialize the document processor.
+        
+        Args:
+            model_name: Name of the SentenceTransformer model to use
+        """
+        self.model_name = model_name
+        self.model = None  # Lazy loading
+        self.index = None
+        self.documents = {}
+        self.chunks = []
+        
+        logger.info(f"Initialized DocumentProcessor with model {model_name}")
+    
+    def _load_model(self):
+        """Load the embedding model if not already loaded."""
+        if self.model is None:
+            logger.info(f"Loading sentence transformer model: {self.model_name}")
+            self.model = SentenceTransformer(self.model_name)
+    
+    def extract_text_from_file(self, file_path: str) -> Tuple[str, Dict]:
+        """
+        Extract text from a file based on its extension.
         
         Args:
             file_path: Path to the file
-            document_id: ID for the document (default: file name)
-            chunk_size: Maximum chunk size in characters
-            overlap: Overlap between chunks in characters
-            metadata: Additional metadata for the document
             
         Returns:
-            List of chunk IDs added to the collection
+            Tuple of (extracted text, metadata)
         """
-        logger.info(f"Processing file: {file_path}")
+        logger.info(f"Extracting text from {file_path}")
         
-        if not os.path.isfile(file_path):
-            logger.error(f"File not found: {file_path}")
-            return []
+        file_ext = os.path.splitext(file_path)[1].lower()
+        metadata = {}
         
-        # Determine document ID
-        if document_id is None:
-            document_id = os.path.basename(file_path)
-        
-        # Initialize metadata
-        if metadata is None:
-            metadata = {}
-            
-        # Add file metadata
-        file_metadata = {
-            'source': file_path,
-            'file_type': file_path.split('.')[-1].lower(),
-            'file_size': os.path.getsize(file_path),
-            'modified_time': os.path.getmtime(file_path)
-        }
-        metadata.update(file_metadata)
-        
-        # Read file content
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                text = f.read()
-        except UnicodeDecodeError:
-            logger.warning(f"Unicode decode error, trying with latin-1 encoding: {file_path}")
-            with open(file_path, 'r', encoding='latin-1') as f:
-                text = f.read()
-        
-        # Process chunks
-        return self.process_text(text, document_id, chunk_size, overlap, metadata)
+            if file_ext == '.pdf':
+                return self._extract_from_pdf(file_path)
+            elif file_ext in ['.docx', '.doc']:
+                return self._extract_from_docx(file_path)
+            elif file_ext in ['.txt', '.md', '.html', '.htm']:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    return f.read(), metadata
+            else:
+                logger.warning(f"Unsupported file type: {file_ext}")
+                return "", metadata
+        except Exception as e:
+            logger.error(f"Error extracting text from {file_path}: {e}")
+            return "", metadata
     
-    def process_text(self, text: str, document_id: str, chunk_size: int = 1000, 
-                   overlap: int = 200, metadata: Optional[Dict[str, Any]] = None) -> List[str]:
+    def _extract_from_pdf(self, file_path: str) -> Tuple[str, Dict]:
+        """Extract text from PDF file."""
+        text = ""
+        metadata = {}
+        
+        with open(file_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            
+            # Extract metadata
+            if reader.metadata:
+                metadata = {
+                    'title': reader.metadata.get('/Title', ''),
+                    'author': reader.metadata.get('/Author', ''),
+                    'creation_date': reader.metadata.get('/CreationDate', '')
+                }
+            
+            # Extract text from all pages
+            for page_num in range(len(reader.pages)):
+                page = reader.pages[page_num]
+                text += page.extract_text() + "\n\n"
+        
+        return text, metadata
+    
+    def _extract_from_docx(self, file_path: str) -> Tuple[str, Dict]:
+        """Extract text from DOCX file."""
+        doc = docx.Document(file_path)
+        metadata = {
+            'title': doc.core_properties.title or '',
+            'author': doc.core_properties.author or '',
+            'created': str(doc.core_properties.created) if doc.core_properties.created else ''
+        }
+        
+        # Extract text from paragraphs
+        text = "\n".join([para.text for para in doc.paragraphs])
+        
+        return text, metadata
+    
+    def add_document(self, file_path: str, doc_id: Optional[str] = None) -> Optional[Document]:
         """
-        Process text into document chunks
+        Process and add a document.
         
         Args:
-            text: Text content
-            document_id: ID for the document
-            chunk_size: Maximum chunk size in characters
-            overlap: Overlap between chunks in characters
-            metadata: Additional metadata for the document
+            file_path: Path to the document file
+            doc_id: Optional document ID (default: file name)
             
         Returns:
-            List of chunk IDs added to the collection
+            Document object if successful, None otherwise
         """
-        # Initialize metadata
-        if metadata is None:
-            metadata = {}
-            
-        # Split text into chunks
-        chunks = self._chunk_text(text, chunk_size, overlap)
+        if not os.path.exists(file_path):
+            logger.error(f"File not found: {file_path}")
+            return None
         
-        # Create document objects for each chunk
-        chunk_ids = []
-        for i, chunk in enumerate(chunks):
-            chunk_id = f"{document_id}_chunk_{i+1}"
-            chunk_metadata = metadata.copy()
-            chunk_metadata.update({
-                'document_id': document_id,
-                'chunk_index': i,
-                'chunk_count': len(chunks)
-            })
-            
-            # Create document object
-            document = Document(
-                doc_id=chunk_id,
-                text=chunk,
-                metadata=chunk_metadata
-            )
-            
-            # Add to collection
-            self.collection.add_document(document)
-            chunk_ids.append(chunk_id)
+        # Use filename as ID if not provided
+        if doc_id is None:
+            doc_id = os.path.basename(file_path)
         
-        logger.info(f"Processed {document_id} into {len(chunks)} chunks")
-        return chunk_ids
+        # Extract text and metadata
+        text, metadata = self.extract_text_from_file(file_path)
+        
+        if not text:
+            logger.warning(f"No text extracted from {file_path}")
+            return None
+        
+        # Create document
+        doc = Document(
+            doc_id=doc_id,
+            text=text,
+            source=file_path,
+            title=metadata.get('title', None),
+            author=metadata.get('author', None),
+            date=metadata.get('creation_date', metadata.get('created', None)),
+            metadata=metadata
+        )
+        
+        # Add to documents
+        self.documents[doc_id] = doc
+        
+        # Add chunks to the list
+        self.chunks.extend(doc.chunks)
+        
+        logger.info(f"Added document {doc_id} with {len(doc.chunks)} chunks")
+        return doc
     
-    def process_directory(self, directory: str, file_extensions: List[str] = None, 
-                        recursive: bool = True, chunk_size: int = 1000, 
-                        overlap: int = 200) -> Dict[str, List[str]]:
+    def add_documents_from_directory(self, dir_path: str, extensions: List[str] = None) -> List[Document]:
         """
-        Process all files in a directory
+        Process and add all documents from a directory.
         
         Args:
-            directory: Directory path
-            file_extensions: List of file extensions to process (e.g., ['.txt', '.md'])
-            recursive: Whether to process subdirectories
-            chunk_size: Maximum chunk size in characters
-            overlap: Overlap between chunks in characters
+            dir_path: Path to the directory
+            extensions: List of file extensions to process (default: ['.pdf', '.docx', '.txt'])
             
         Returns:
-            Dictionary mapping file paths to lists of chunk IDs
+            List of added documents
         """
-        logger.info(f"Processing directory: {directory}")
+        if extensions is None:
+            extensions = ['.pdf', '.docx', '.txt', '.md']
         
-        if not os.path.isdir(directory):
-            logger.error(f"Directory not found: {directory}")
-            return {}
+        added_docs = []
         
-        # Default file extensions
-        if file_extensions is None:
-            file_extensions = ['.txt', '.md', '.csv', '.json']
-            
-        # Make sure all extensions start with a dot
-        file_extensions = [ext if ext.startswith('.') else f'.{ext}' for ext in file_extensions]
-        
-        # Process files
-        result = {}
-        for root, dirs, files in os.walk(directory):
+        for root, _, files in os.walk(dir_path):
             for file in files:
-                file_path = os.path.join(root, file)
-                file_ext = os.path.splitext(file_path)[1].lower()
-                
-                if file_ext in file_extensions:
-                    chunk_ids = self.process_file(
-                        file_path=file_path,
-                        chunk_size=chunk_size,
-                        overlap=overlap
-                    )
-                    result[file_path] = chunk_ids
-            
-            # Skip subdirectories if not recursive
-            if not recursive:
-                break
+                ext = os.path.splitext(file)[1].lower()
+                if ext in extensions:
+                    file_path = os.path.join(root, file)
+                    doc = self.add_document(file_path)
+                    if doc:
+                        added_docs.append(doc)
         
-        logger.info(f"Processed {len(result)} files in {directory}")
-        return result
+        logger.info(f"Added {len(added_docs)} documents from {dir_path}")
+        return added_docs
     
-    def generate_embeddings(self, batch_size: int = 32, use_existing: bool = True) -> None:
-        """
-        Generate embeddings for all documents in the collection
-        
-        Args:
-            batch_size: Batch size for embedding generation
-            use_existing: Whether to use existing embeddings
-        """
-        # Collect documents that need embeddings
-        documents_to_embed = []
-        doc_ids = []
-        
-        for doc_id, doc in self.collection.documents.items():
-            if not use_existing or doc.embedding is None:
-                documents_to_embed.append(doc.text)
-                doc_ids.append(doc_id)
-        
-        if not documents_to_embed:
-            logger.info("No documents need embeddings")
+    def build_index(self):
+        """Build search index from document chunks."""
+        if not self.chunks:
+            logger.warning("No documents to index")
             return
         
-        logger.info(f"Generating embeddings for {len(documents_to_embed)} documents")
+        logger.info(f"Building index from {len(self.chunks)} chunks")
+        
+        # Load model if not already loaded
+        self._load_model()
+        
+        # Get text from all chunks
+        texts = [chunk['text'] for chunk in self.chunks]
         
         # Generate embeddings
-        if HAVE_SENTENCE_TRANSFORMERS:
-            # Process in batches
-            embeddings = []
-            for i in range(0, len(documents_to_embed), batch_size):
-                batch_texts = documents_to_embed[i:i+batch_size]
-                batch_embeddings = self.embedding_model.encode(batch_texts)
-                embeddings.extend(batch_embeddings)
-                logger.info(f"Generated embeddings for batch {i//batch_size + 1}/{(len(documents_to_embed)-1)//batch_size + 1}")
-        else:
-            # Fit the vectorizer if not already fitted
-            if not hasattr(self, '_fitted') or not self._fitted:
-                self.embedding_model.fit(documents_to_embed)
-                self._fitted = True
+        chunk_embeddings = self.model.encode(texts, show_progress_bar=True)
+        
+        # Create Faiss index
+        dimension = chunk_embeddings.shape[1]
+        self.index = faiss.IndexFlatL2(dimension)
+        self.index.add(np.array(chunk_embeddings).astype('float32'))
+        
+        logger.info(f"Index built with dimension {dimension}")
+    
+    def search(self, query: str, k: int = 5) -> List[Dict]:
+        """
+        Search for chunks relevant to a query.
+        
+        Args:
+            query: Search query
+            k: Number of results to return
             
-            # Transform documents to embeddings
-            embeddings_matrix = self.embedding_model.transform(documents_to_embed)
-            embeddings = [embeddings_matrix[i].toarray()[0] for i in range(embeddings_matrix.shape[0])]
-        
-        # Update document embeddings
-        for i, doc_id in enumerate(doc_ids):
-            doc = self.collection.documents[doc_id]
-            doc.embedding = embeddings[i]
-            self.collection.embeddings[doc_id] = embeddings[i]
-        
-        logger.info(f"Generated embeddings for {len(doc_ids)} documents")
-    
-    def save_collection(self, directory: str = 'document_index'):
+        Returns:
+            List of dictionaries with search results and source documents
         """
-        Save the document collection to files
+        if not self.index:
+            logger.warning("No index available. Call build_index() first.")
+            return []
+        
+        # Load model if not already loaded
+        self._load_model()
+        
+        # Encode query
+        query_vector = self.model.encode([query])[0].reshape(1, -1).astype('float32')
+        
+        # Search
+        distances, indices = self.index.search(query_vector, k=min(k, len(self.chunks)))
+        
+        results = []
+        for i, idx in enumerate(indices[0]):
+            if idx < 0 or idx >= len(self.chunks):
+                continue
+                
+            chunk = self.chunks[idx]
+            doc_id = chunk['doc_id']
+            document = self.documents.get(doc_id)
+            
+            if document:
+                results.append({
+                    'chunk': chunk,
+                    'document': document.to_dict(),
+                    'score': float(1.0 / (1.0 + distances[0][i])),
+                    'distance': float(distances[0][i])
+                })
+        
+        return results
+    
+    def save(self, output_dir: str):
+        """
+        Save processed documents and index.
         
         Args:
-            directory: Directory to save the collection
+            output_dir: Directory to save to
         """
-        self.collection.save(directory)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save documents metadata
+        docs_metadata = {doc_id: doc.to_dict() for doc_id, doc in self.documents.items()}
+        with open(os.path.join(output_dir, 'documents_metadata.json'), 'w') as f:
+            json.dump(docs_metadata, f, indent=2)
+        
+        # Save documents text
+        for doc_id, doc in self.documents.items():
+            with open(os.path.join(output_dir, f"{doc_id}.txt"), 'w', encoding='utf-8') as f:
+                f.write(doc.text)
+        
+        # Save chunks
+        with open(os.path.join(output_dir, 'chunks.json'), 'w') as f:
+            json.dump(self.chunks, f, indent=2)
+        
+        # Save index if available
+        if self.index is not None:
+            faiss.write_index(self.index, os.path.join(output_dir, 'document_index.faiss'))
+        
+        logger.info(f"Saved documents and index to {output_dir}")
     
-    def load_collection(self, directory: str = 'document_index'):
+    @classmethod
+    def load(cls, input_dir: str) -> 'DocumentProcessor':
         """
-        Load a document collection from files
+        Load processed documents and index.
         
         Args:
-            directory: Directory to load the collection from
+            input_dir: Directory to load from
+            
+        Returns:
+            DocumentProcessor object
         """
-        self.collection = DocumentCollection.load(directory)
+        processor = cls()
         
-        # Make sure the embedding model is fitted if using TF-IDF
-        if not HAVE_SENTENCE_TRANSFORMERS and self.collection.documents:
-            # Extract texts for fitting
-            texts = [doc.text for doc in self.collection.documents.values()]
-            self.embedding_model.fit(texts)
-            self._fitted = True
-    
-    def get_collection(self) -> DocumentCollection:
-        """Get the document collection"""
-        return self.collection
+        # Load documents metadata
+        metadata_path = os.path.join(input_dir, 'documents_metadata.json')
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r') as f:
+                docs_metadata = json.load(f)
+            
+            # Load documents
+            for doc_id, metadata in docs_metadata.items():
+                text_path = os.path.join(input_dir, f"{doc_id}.txt")
+                if os.path.exists(text_path):
+                    with open(text_path, 'r', encoding='utf-8') as f:
+                        text = f.read()
+                    
+                    doc = Document.from_dict(metadata, text)
+                    processor.documents[doc_id] = doc
+        
+        # Load chunks
+        chunks_path = os.path.join(input_dir, 'chunks.json')
+        if os.path.exists(chunks_path):
+            with open(chunks_path, 'r') as f:
+                processor.chunks = json.load(f)
+        
+        # Load index if available
+        index_path = os.path.join(input_dir, 'document_index.faiss')
+        if os.path.exists(index_path):
+            processor.index = faiss.read_index(index_path)
+        
+        logger.info(f"Loaded {len(processor.documents)} documents and {len(processor.chunks)} chunks from {input_dir}")
+        return processor
 
 def main():
     """
-    Main function to demonstrate the document processor
+    Main function to process documents.
     """
     import argparse
     
     parser = argparse.ArgumentParser(description='Process documents for question answering')
-    parser.add_argument('--input', required=True, help='Input file or directory')
-    parser.add_argument('--output', default='document_index', help='Output directory for document index')
-    parser.add_argument('--model', default='all-MiniLM-L6-v2', help='Embedding model name')
-    parser.add_argument('--chunk-size', type=int, default=1000, help='Maximum chunk size in characters')
-    parser.add_argument('--overlap', type=int, default=200, help='Overlap between chunks in characters')
-    parser.add_argument('--recursive', action='store_true', help='Process directories recursively')
-    parser.add_argument('--extensions', default='.txt,.md,.csv,.json', help='Comma-separated list of file extensions to process')
+    parser.add_argument('--input', required=True, help='Input directory or file')
+    parser.add_argument('--output', required=True, help='Output directory for processed documents')
+    parser.add_argument('--model', default='paraphrase-MiniLM-L6-v2', help='SentenceTransformer model name')
     
     args = parser.parse_args()
     
-    # Initialize processor
     processor = DocumentProcessor(model_name=args.model)
     
-    # Process input
     if os.path.isdir(args.input):
-        file_extensions = args.extensions.split(',')
-        processor.process_directory(
-            directory=args.input,
-            file_extensions=file_extensions,
-            recursive=args.recursive,
-            chunk_size=args.chunk_size,
-            overlap=args.overlap
-        )
-    elif os.path.isfile(args.input):
-        processor.process_file(
-            file_path=args.input,
-            chunk_size=args.chunk_size,
-            overlap=args.overlap
-        )
+        processor.add_documents_from_directory(args.input)
     else:
-        logger.error(f"Input not found: {args.input}")
-        return 1
+        processor.add_document(args.input)
     
-    # Generate embeddings
-    processor.generate_embeddings()
+    processor.build_index()
+    processor.save(args.output)
     
-    # Save collection
-    processor.save_collection(args.output)
-    
-    logger.info(f"Document processing complete. Index saved to {args.output}")
-    return 0
+    logger.info("Document processing completed")
 
 if __name__ == "__main__":
-    import sys
-    sys.exit(main())
+    main()
