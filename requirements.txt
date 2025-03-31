@@ -9,3 +9,15 @@ lightgbm==3.3.5
 xgboost==1.7.5
 imbalanced-learn==0.10.1
 optuna==3.1.1
+# Neue Abhängigkeiten für Dokumentenverarbeitung und QA
+transformers==4.29.2
+sentence-transformers==2.2.2
+torch==2.0.1
+nltk==3.8.1
+spacy==3.5.3
+python-docx==0.8.11
+PyPDF2==3.0.1
+faiss-cpu==1.7.4
+langchain==0.0.267
+rank_bm25==0.2.2
+tiktoken==0.4.0
