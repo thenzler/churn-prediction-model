@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Distribution / packaging
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Data and models (don't commit large files)
+data/*.csv
+model/*.pkl
+model/*.joblib
+visualizations/*.png
+visualizations/*.jpg
+visualizations/*.json
+
+# Logs
+*.log
+logs/
+pipeline_*.log
+
+# OS specific
+.DS_Store
+Thumbs.db
